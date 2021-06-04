@@ -42,17 +42,19 @@ class Quarantine
         ).void
       end
       def write_items(table_name, items)
-        @dynamodb.batch_write_item(
-          request_items: {
-            table_name => items.map do |item|
-              {
-                put_request: {
-                  item: item
+        items.each_slice(25).to_a.each do |slice|
+          @dynamodb.batch_write_item(
+            request_items: {
+              table_name => slice.map do |item|
+                {
+                  put_request: {
+                    item: item
+                  }
                 }
-              }
-            end
-          }
-        )
+              end
+            }
+          )
+        end
       rescue Aws::DynamoDB::Errors::ServiceError
         raise Quarantine::DatabaseError
       end
