@@ -1,157 +1,222 @@
+# typed: false
 require 'spec_helper'
 
 describe Quarantine do
-  context '#initialize' do
-    it 'all instance variables to the default value' do
-      quarantine = Quarantine.new
-
-      expect(quarantine.database).to be_a(Quarantine::Databases::DynamoDB)
-      expect(quarantine.quarantine_map).to eq({})
-      expect(quarantine.failed_tests).to eq([])
-      expect(quarantine.flaky_tests).to eq([])
-    end
+  let(:database_options) do
+    {
+      type: :dynamodb,
+      region: 'us-west-1'
+    }
   end
 
-  context '#fetch_quarantine_list' do
+  let(:options) do
+    {
+      database: database_options,
+      test_statuses_table_name: 'foo',
+      logging: true,
+      log: ->(message) { puts message }
+    }
+  end
+
+  context '#on_start' do
     test1 = {
       'full_description' => 'quarantined_test_1',
       'id' => '1',
       'location' => 'line 1',
-      'build_number' => '123'
+      'last_status' => 'quarantined',
+      'consecutive_passes' => 1,
+      'extra_attributes' => {}
     }
 
     test2 = {
       'full_description' => 'quarantined_test_2',
       'id' => '2',
       'location' => 'line 2',
-      'build_number' => '-1'
+      'last_status' => 'quarantined',
+      'consecutive_passes' => 1,
+      'extra_attributes' => {}
     }
 
-    test1_duplicate = {
-      'full_description' => 'quarantined_test_1',
-      'id' => '1',
-      'location' => 'line 3',
-      'build_number' => '124'
-    }
-
-    let(:quarantine) { Quarantine.new }
+    let(:quarantine) { Quarantine.new(options) }
     let(:dynamodb) { Aws::DynamoDB::Client.new({ stub_responses: true }) }
     let(:stub_multiple_tests) { dynamodb.stub_data(:scan, { items: [test1, test2] }) }
-    let(:stub_duplicate_tests_replace) do
-      dynamodb.stub_data(
-        :scan,
-        { items: [
-          test1,
-          test1_duplicate
-        ] }
-      )
-    end
-    let(:stub_duplicate_tests_add) do
-      dynamodb.stub_data(
-        :scan,
-        { items: [
-          test1_duplicate,
-          test1
-        ] }
-      )
-    end
 
     it 'correctly stores quarantined tests pulled from DynamoDB' do
-      allow(quarantine.database).to receive(:scan).and_return(stub_multiple_tests.items)
+      expect(quarantine.database).to receive(:fetch_items).and_return([test1, test2])
 
-      quarantine.fetch_quarantine_list
+      quarantine.on_start
 
-      expect(quarantine.quarantine_map.size).to eq(2)
-      expect(quarantine.quarantine_map.key?('1')).to eq(true)
-      expect(quarantine.quarantine_map.key?('2')).to eq(true)
-    end
-
-    it 'if duplicate test ids and the quarantine_map test is older, replace it with the newer test' do
-      allow(quarantine.database).to receive(:scan).and_return(stub_duplicate_tests_replace.items)
-      quarantine.fetch_quarantine_list
-
-      expect(quarantine.quarantine_map.size).to eq(1)
-      expect(quarantine.quarantine_map.key?('1')).to eq(true)
-      expect(quarantine.quarantine_map['1'].build_number).to eq('124')
-    end
-
-    it 'if duplicate test ids and the quarantine_map test is newer, add the older test to duplicate_tests' do
-      allow(quarantine.database).to receive(:scan).and_return(stub_duplicate_tests_add.items)
-      quarantine.fetch_quarantine_list
-
-      expect(quarantine.quarantine_map.size).to eq(1)
-      expect(quarantine.quarantine_map.key?('1')).to eq(true)
-      expect(quarantine.quarantine_map['1'].build_number).to eq('124')
+      expect(quarantine.old_tests.size).to eq(2)
+      expect(quarantine.old_tests.key?('1')).to eq(true)
+      expect(quarantine.old_tests.key?('2')).to eq(true)
     end
 
     it 'if dynamodb.scan fails, make sure an exception is throw' do
       error = Aws::DynamoDB::Errors::LimitExceededException.new(Quarantine, 'limit exceeded')
-      allow(quarantine.database.dynamodb).to receive(:scan).and_raise(error)
+      expect(quarantine.database.dynamodb).to receive(:scan).and_raise(error)
 
-      expect { quarantine.fetch_quarantine_list }.to raise_error(Quarantine::DatabaseError)
+      expect { quarantine.on_start }.to raise_error(Quarantine::DatabaseError)
 
-      expect(quarantine.summary[:database_failures].length).to eq(1)
-      expect(quarantine.summary[:database_failures][0]).to eq(
-        'Aws::DynamoDB::Errors::LimitExceededException: limit exceeded'
+      expect(options[:log]).to receive(:call)
+      expect(options[:log]).to receive(:call).with(
+        include('Aws::DynamoDB::Errors::LimitExceededException: limit exceeded')
       )
+
+      quarantine.on_complete
     end
   end
 
-  context '#record_failed_test' do
-    let(:quarantine) { Quarantine.new }
+  def set_up_test_statuses(quarantine, tests)
+    expect(quarantine.database).to receive(:fetch_items).and_return(tests)
 
-    it 'adds the failed test to the @failed_test array' do |example|
-      quarantine.record_failed_test(example)
+    quarantine.on_start
+  end
 
-      expect(quarantine.failed_tests.length).to eq(1)
-      expect(quarantine.failed_tests[0].id).to eq(example.id)
-      expect(quarantine.failed_tests[0].full_description).to eq(example.full_description)
-      expect(quarantine.failed_tests[0].location).to eq(example.location)
-      expect(quarantine.failed_tests[0].build_number).to eq(quarantine.buildkite_build_number)
+  context '#on_test' do
+    let(:quarantine) { Quarantine.new(options) }
+
+    it 'adds a new flaky test to @tests' do |example|
+      quarantine.on_test(example, :quarantined, passed: true)
+
+      expect(quarantine.tests.length).to eq(1)
+      expect(quarantine.tests[example.id].id).to eq(example.id)
+      expect(quarantine.tests[example.id].status).to eq(:quarantined)
+      expect(quarantine.tests[example.id].consecutive_passes).to eq(1)
+      expect(quarantine.tests[example.id].full_description).to eq(example.full_description)
+      expect(quarantine.tests[example.id].location).to eq(example.location)
+      expect(quarantine.tests[example.id].extra_attributes).to eq({})
+    end
+
+    it 'adds a new failed test to @tests' do |example|
+      quarantine.on_test(example, :quarantined, passed: false)
+
+      expect(quarantine.tests.length).to eq(1)
+      expect(quarantine.tests[example.id].id).to eq(example.id)
+      expect(quarantine.tests[example.id].status).to eq(:quarantined)
+      expect(quarantine.tests[example.id].consecutive_passes).to eq(0)
+      expect(quarantine.tests[example.id].full_description).to eq(example.full_description)
+      expect(quarantine.tests[example.id].location).to eq(example.location)
+      expect(quarantine.tests[example.id].extra_attributes).to eq({})
+    end
+
+    context 'with old test' do
+      it 'adds a flaky test to @tests' do |example|
+        set_up_test_statuses(
+          quarantine,
+          [{
+            'id' => example.id,
+            'last_status' => 'quarantined',
+            'consecutive_passes' => 5,
+            'full_description' => 'quarantined_test',
+            'location' => 'line 1',
+            'extra_attributes' => {}
+          }]
+        )
+
+        quarantine.on_test(example, :quarantined, passed: true)
+
+        expect(quarantine.tests.length).to eq(1)
+        expect(quarantine.tests[example.id].id).to eq(example.id)
+        expect(quarantine.tests[example.id].status).to eq(:quarantined)
+        expect(quarantine.tests[example.id].consecutive_passes).to eq(6)
+      end
+
+      context 'with release_at_consecutive_passes' do
+        let(:options) { { database: database_options, release_at_consecutive_passes: 6 } }
+
+        it 'releases the test' do |example|
+          set_up_test_statuses(
+            quarantine,
+            [{
+              'id' => example.id,
+              'last_status' => 'quarantined',
+              'consecutive_passes' => 5,
+              'full_description' => 'quarantined_test',
+              'location' => 'line 1',
+              'extra_attributes' => {}
+            }]
+          )
+
+          quarantine.on_test(example, :quarantined, passed: true)
+
+          expect(quarantine.tests.length).to eq(1)
+          expect(quarantine.tests[example.id].id).to eq(example.id)
+          expect(quarantine.tests[example.id].status).to eq(:passing)
+          expect(quarantine.tests[example.id].consecutive_passes).to eq(6)
+        end
+      end
+    end
+
+    context 'with extra attributes' do
+      let(:options) { { database: database_options, extra_attributes: proc { { build_number: 5 } } } }
+
+      it 'adds a new flaky test to @tests' do |example|
+        quarantine.on_test(example, :quarantined, passed: true)
+
+        expect(quarantine.tests.length).to eq(1)
+        expect(quarantine.tests[example.id].id).to eq(example.id)
+        expect(quarantine.tests[example.id].status).to eq(:quarantined)
+        expect(quarantine.tests[example.id].full_description).to eq(example.full_description)
+        expect(quarantine.tests[example.id].location).to eq(example.location)
+        expect(quarantine.tests[example.id].extra_attributes).to eq(build_number: 5)
+      end
     end
   end
 
-  context '#record_flaky_test' do
-    let(:quarantine) { Quarantine.new }
+  context '#on_complete' do
+    let(:quarantine) do
+      new_options = options.merge(
+        test_statuses_table_name: 'test_statuses',
+        failsafe_limit: failsafe_limit,
+        record_tests: true
+      )
+      Quarantine.new(new_options)
+    end
+    let(:failsafe_limit) { 10 }
 
-    it 'adds the flaky test to the @flaky_test array' do |example|
-      quarantine.record_flaky_test(example)
+    it 'uploads with a test' do |example|
+      quarantine.on_test(example, :quarantined, passed: true)
+      expect(quarantine.database).to receive(:write_items)
+      quarantine.on_complete
+    end
 
-      expect(quarantine.flaky_tests.length).to eq(1)
-      expect(quarantine.flaky_tests[0].id).to eq(example.id)
-      expect(quarantine.flaky_tests[0].full_description).to eq(example.full_description)
-      expect(quarantine.flaky_tests[0].location).to eq(example.location)
-      expect(quarantine.flaky_tests[0].build_number).to eq(quarantine.buildkite_build_number)
+    it "doesn't upload with no tests" do |_example|
+      expect(quarantine.database).to_not receive(:write_items)
+      quarantine.on_complete
+    end
+
+    context 'with low failsafe limit' do
+      let(:failsafe_limit) { 1 }
+
+      it "doesn't upload" do |example|
+        quarantine.on_test(example, :quarantined, passed: true)
+        expect(quarantine.database).to_not receive(:write_items)
+        quarantine.on_complete
+      end
     end
   end
 
   context '#test_quarantined?' do
-    let(:quarantine) { Quarantine.new }
+    let(:quarantine) { Quarantine.new(options) }
 
     it 'returns true on quarantined test' do |example|
-      quarantine.quarantine_map.store(
-        example.id,
-        Quarantine::Test.new(
-          example.id,
-          example.full_description,
-          example.location,
-          '123'
-        )
+      set_up_test_statuses(
+        quarantine,
+        [{
+          'id' => example.id,
+          'last_status' => 'quarantined',
+          'consecutive_passes' => 1,
+          'full_description' => 'quarantined_test',
+          'location' => 'line 1',
+          'extra_attributes' => {}
+        }]
       )
+
       expect(quarantine.test_quarantined?(example)).to eq(true)
     end
 
     it 'returns false on a non-quarantined test' do |example|
       expect(quarantine.test_quarantined?(example)).to eq(false)
-    end
-  end
-
-  context '#pass_flaky_test' do
-    let(:quarantine) { Quarantine.new }
-
-    it 'passes a failing test' do |example|
-      example.set_exception(StandardError.new)
-      quarantine.pass_flaky_test(example)
     end
   end
 end

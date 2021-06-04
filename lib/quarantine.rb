@@ -1,141 +1,151 @@
+# typed: strict
+
+require 'sorbet-runtime'
+
 require 'rspec/retry'
 require 'quarantine/rspec_adapter'
 require 'quarantine/test'
 require 'quarantine/databases/base'
 require 'quarantine/databases/dynamo_db'
+require 'quarantine/databases/google_sheets'
 
 class Quarantine
-  extend RSpecAdapter
+  extend T::Sig
 
-  attr_accessor :database
-  attr_reader :quarantine_map
-  attr_reader :failed_tests
-  attr_reader :flaky_tests
-  attr_reader :duplicate_tests
-  attr_reader :buildkite_build_number
-  attr_reader :summary
+  sig { returns(T::Hash[String, Quarantine::Test]) }
+  attr_reader :tests
 
-  def initialize(options = {})
-    case options[:database]
-    # default database option is dynamodb
-    when :dynamodb, nil
-      @database = Quarantine::Databases::DynamoDB.new(options)
-    else
-      raise Quarantine::UnsupportedDatabaseError.new("Quarantine does not support #{options[:database]}")
-    end
+  sig { returns(T::Hash[String, Quarantine::Test]) }
+  attr_reader :old_tests
 
-    @quarantine_map = {}
-    @failed_tests = []
-    @flaky_tests = []
-    @buildkite_build_number = ENV['BUILDKITE_BUILD_NUMBER'] || '-1'
-    @summary = { id: 'quarantine', quarantined_tests: [], flaky_tests: [], database_failures: [] }
+  sig { params(options: T::Hash[T.untyped, T.untyped]).void }
+  def initialize(options)
+    @options = options
+    @old_tests = T.let({}, T::Hash[String, Quarantine::Test])
+    @tests = T.let({}, T::Hash[String, Quarantine::Test])
+    @database_failures = T.let([], T::Array[String])
+    @database = T.let(nil, T.nilable(Quarantine::Databases::Base))
   end
 
-  # Scans the quarantine_list from the database and store the individual tests in quarantine_map
-  def fetch_quarantine_list
+  sig { returns(Quarantine::Databases::Base) }
+  def database
+    @database ||=
+      case @options[:database]
+      when Quarantine::Databases::Base
+        @options[:database]
+      else
+        database_options = @options[:database].dup
+        type = database_options.delete(:type)
+        case type
+        when :dynamodb
+          Quarantine::Databases::DynamoDB.new(database_options)
+        when :google_sheets
+          Quarantine::Databases::GoogleSheets.new(database_options)
+        else
+          raise Quarantine::UnsupportedDatabaseError.new("Quarantine does not support database type: #{type.inspect}")
+        end
+      end
+  end
+
+  # Scans the test_statuses from the database and store their IDs in quarantined_ids
+  sig { void }
+  def on_start
     begin
-      quarantine_list = database.scan(RSpec.configuration.quarantine_list_table)
+      test_statuses = database.fetch_items(@options[:test_statuses_table_name])
     rescue Quarantine::DatabaseError => e
-      add_to_summary(:database_failures, "#{e&.cause&.class}: #{e&.cause&.message}")
+      @database_failures << "#{e.cause&.class}: #{e.cause&.message}"
       raise Quarantine::DatabaseError.new(
         <<~ERROR_MSG
-          Failed to pull the quarantine list from #{RSpec.configuration.quarantine_list_table}
-          because of #{e&.cause&.class}: #{e&.cause&.message}
+          Failed to pull the quarantine list from #{@options[:test_statuses_table_name]}
+          because of #{e.cause&.class}: #{e.cause&.message}
         ERROR_MSG
       )
     end
 
-    quarantine_list.each do |example|
-      # on the rare occassion there are duplicate tests ids in the quarantine_list,
-      # quarantine the most recent instance of the test (det. through build_number)
-      # and ignore the older instance of the test
-      next if
-        quarantine_map.key?(example['id']) &&
-        example['build_number'].to_i < quarantine_map[example['id']].build_number.to_i
+    pairs =
+      test_statuses
+      .group_by { |t| t['id'] }
+      .map { |_id, tests| tests.max_by { |t| t['created_at'] } }
+      .compact
+      .filter { |t| t['last_status'] == 'quarantined' }
+      .map do |t|
+        [
+          t['id'],
+          Quarantine::Test.new(
+            id: t['id'],
+            status: t['last_status'].to_sym,
+            consecutive_passes: t['consecutive_passes'].to_i,
+            full_description: t['full_description'],
+            location: t['location'],
+            extra_attributes: t['extra_attributes']
+          )
+        ]
+      end
 
-      quarantine_map.store(
-        example['id'],
-        Quarantine::Test.new(example['id'], example['full_description'], example['location'], example['build_number'])
-      )
-    end
+    @old_tests = Hash[pairs]
   end
 
-  # Based off the type, upload a list of tests to a particular database table
-  def upload_tests(type)
-    if type == :failed
-      tests = failed_tests
-      table_name = RSpec.configuration.quarantine_failed_tests_table
-    elsif type == :flaky
-      tests = flaky_tests
-      table_name = RSpec.configuration.quarantine_list_table
+  sig { void }
+  def on_complete
+    quarantined_tests = @tests.values.select { |test| test.status == :quarantined }.sort_by(&:id)
+
+    if !@options[:record_tests]
+      log('Recording tests disabled; skipping')
+    elsif @tests.empty?
+      log('No tests found; skipping recording')
+    elsif quarantined_tests.count { |test| old_tests[test.id]&.status != :quarantined } >= @options[:failsafe_limit]
+      log('Number of quarantined tests above failsafe limit; skipping recording')
     else
-      raise Quarantine::UnknownUploadError.new(
-        "Quarantine gem did not know how to handle #{type} upload of tests to dynamodb"
-      )
+      begin
+        timestamp = Time.now.to_i / 1000 # Truncated millisecond from timestamp for reasons specific to Flexport
+        database.write_items(
+          @options[:test_statuses_table_name],
+          @tests.values.map { |item| item.to_hash.merge('updated_at' => timestamp) }
+        )
+      rescue Quarantine::DatabaseError => e
+        @database_failures << "#{e.cause&.class}: #{e.cause&.message}"
+      end
     end
 
-    return unless tests.length < 10 && tests.length > 0
+    log(<<~MESSAGE)
+      \n[quarantine] Quarantined tests:
+        #{quarantined_tests.map { |test| "#{test.id} #{test.full_description}" }.join("\n  ")}
 
-    begin
-      timestamp = Time.now.to_i / 1000 # Truncated millisecond from timestamp for reasons specific to Flexport
-      database.batch_write_item(
-        table_name,
-        tests,
-        {
-          build_job_id: ENV['BUILDKITE_JOB_ID'] || '-1',
-          created_at: timestamp,
-          updated_at: timestamp
-        }
-      )
-    rescue Quarantine::DatabaseError => e
-      add_to_summary(:database_failures, "#{e&.cause&.class}: #{e&.cause&.message}")
-    end
+      [quarantine] Database errors:
+        #{@database_failures.join("\n  ")}
+    MESSAGE
   end
 
   # Param: RSpec::Core::Example
-  # Add the example to the internal failed tests list
-  def record_failed_test(example)
-    failed_tests << Quarantine::Test.new(
-      example.id,
-      example.full_description,
-      example.location,
-      buildkite_build_number
-    )
-  end
+  # Add the example to the internal tests list
+  sig { params(example: T.untyped, status: Symbol, passed: T::Boolean).void }
+  def on_test(example, status, passed:)
+    extra_attributes = @options[:extra_attributes] ? @options[:extra_attributes].call(example) : {}
 
-  # Param: RSpec::Core::Example
-  # Add the example to the internal flaky tests list
-  def record_flaky_test(example)
-    flaky_test = Quarantine::Test.new(
-      example.id,
-      example.full_description,
-      example.location,
-      buildkite_build_number
+    new_consecutive_passes = passed ? (@old_tests[example.id]&.consecutive_passes || 0) + 1 : 0
+    release_at = @options[:release_at_consecutive_passes]
+    new_status = !release_at.nil? && new_consecutive_passes >= release_at ? :passing : status
+    test = Quarantine::Test.new(
+      id: example.id,
+      status: new_status,
+      consecutive_passes: new_consecutive_passes,
+      full_description: example.full_description,
+      location: example.location,
+      extra_attributes: extra_attributes
     )
 
-    flaky_tests << flaky_test
-    add_to_summary(:flaky_tests, flaky_test.id)
+    @tests[test.id] = test
   end
 
   # Param: RSpec::Core::Example
-  # Clear exceptions on a flaky tests that has been quarantined
-  #
-  # example.clear_exception is tightly coupled with the rspec-retry gem and will only exist if
-  # the rspec-retry gem is enabled
-  def pass_flaky_test(example)
-    example.clear_exception
-    add_to_summary(:quarantined_tests, example.id)
-  end
-
-  # Param: RSpec::Core::Example
-  # Check the internal quarantine_map to see if this test should be quarantined
+  # Check the internal old_tests to see if this test should be quarantined
+  sig { params(example: T.untyped).returns(T::Boolean) }
   def test_quarantined?(example)
-    quarantine_map.key?(example.id)
+    @old_tests[example.id]&.status == :quarantined
   end
 
-  # Param: Symbol, Any
-  # Adds the item to the specified attribute in summary
-  def add_to_summary(attribute, item)
-    summary[attribute] << item if summary.key?(attribute)
+  sig { params(message: String).void }
+  def log(message)
+    @options[:log].call(message) if @options[:logging]
   end
 end

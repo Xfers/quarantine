@@ -1,32 +1,25 @@
+# typed: strict
+
 class Quarantine
-  class Test
-    attr_accessor :id
-    attr_accessor :full_description
-    attr_accessor :location
-    attr_accessor :build_number
+  class Test < T::Struct
+    extend T::Sig
 
-    def initialize(id, full_description, location, build_number)
-      @id = id
-      @full_description = full_description
-      @location = location
-      @build_number = build_number
-    end
+    const :id, String
+    const :status, Symbol
+    const :consecutive_passes, Integer
+    const :full_description, String
+    const :location, String
+    const :extra_attributes, T::Hash[T.untyped, T.untyped]
 
+    sig { returns(Quarantine::Databases::Base::Item) }
     def to_hash
       {
-        id: id,
-        full_description: full_description,
-        location: location,
-        build_number: build_number
-      }
-    end
-
-    def to_string_hash
-      {
         'id' => id,
+        'last_status' => status.to_s,
+        'consecutive_passes' => consecutive_passes,
         'full_description' => full_description,
         'location' => location,
-        'build_number' => build_number
+        'extra_attributes' => extra_attributes
       }
     end
   end

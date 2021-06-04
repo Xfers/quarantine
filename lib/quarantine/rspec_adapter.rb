@@ -1,87 +1,132 @@
-module RSpecAdapter
-  # Purpose: create an instance of Quarantine which contains information
-  #          about the test suite (ie. quarantined tests) and binds RSpec configurations
-  #          and hooks onto the global RSpec class
-  def bind(options = {})
-    quarantine = Quarantine.new(options)
-    bind_rspec_configurations
-    bind_quarantine_list(quarantine)
-    bind_quarantine_checker(quarantine)
-    bind_quarantine_record_tests(quarantine)
-    bind_logger(quarantine)
-  end
+# typed: strict
 
-  private
+module RSpec
+  module Core
+    class Example
+      extend T::Sig
 
-  # Purpose: binds rspec configuration variables
-  def bind_rspec_configurations
-    ::RSpec.configure do |config|
-      config.add_setting(:quarantine_list_table, { default: 'quarantine_list' })
-      config.add_setting(:quarantine_failed_tests_table, { default: 'master_failed_tests' })
-      config.add_setting(:skip_quarantined_tests, { default: true })
-      config.add_setting(:quarantine_record_failed_tests, { default: true })
-      config.add_setting(:quarantine_record_flaky_tests, { default: true })
-      config.add_setting(:quarantine_logging, { default: true })
-    end
-  end
-
-  # Purpose: binds quarantine to fetch the quarantine_list from dynamodb in the before suite
-  def bind_quarantine_list(quarantine)
-    ::RSpec.configure do |config|
-      config.before(:suite) do
-        quarantine.fetch_quarantine_list
+      # The implementation of clear_exception in rspec-retry doesn't work
+      # for examples that use `it_behaves_like`, so we implement our own version that
+      # clear the exception field recursively.
+      sig { void }
+      def clear_exception!
+        @exception = T.let(nil, T.untyped)
+        T.unsafe(self).example.clear_exception! if defined?(example)
       end
     end
   end
+end
 
-  # Purpose: binds quarantine to skip and pass tests that have been quarantined in the after suite
-  def bind_quarantine_checker(quarantine)
-    ::RSpec.configure do |config|
-      config.after(:each) do |example|
-        if RSpec.configuration.skip_quarantined_tests && quarantine.test_quarantined?(example)
-          quarantine.pass_flaky_test(example)
+class Quarantine
+  module RSpecAdapter
+    extend T::Sig
+
+    sig { void }
+    def self.bind
+      register_rspec_configurations
+      bind_on_start
+      bind_on_test
+      bind_on_complete
+    end
+
+    sig { returns(Quarantine) }
+    def self.quarantine
+      @quarantine = T.let(@quarantine, T.nilable(Quarantine))
+      @quarantine ||= Quarantine.new(
+        database: RSpec.configuration.quarantine_database,
+        test_statuses_table_name: RSpec.configuration.quarantine_test_statuses,
+        extra_attributes: RSpec.configuration.quarantine_extra_attributes,
+        failsafe_limit: RSpec.configuration.quarantine_failsafe_limit,
+        release_at_consecutive_passes: RSpec.configuration.quarantine_release_at_consecutive_passes,
+        logging: RSpec.configuration.quarantine_logging,
+        log: method(:log),
+        record_tests: RSpec.configuration.quarantine_record_tests
+      )
+    end
+
+    # Purpose: binds rspec configuration variables
+    sig { void }
+    def self.register_rspec_configurations
+      ::RSpec.configure do |config|
+        config.add_setting(:quarantine_database, default: { type: :dynamodb, region: 'us-west-1' })
+        config.add_setting(:quarantine_test_statuses, { default: 'test_statuses' })
+        config.add_setting(:skip_quarantined_tests, { default: true })
+        config.add_setting(:quarantine_record_tests, { default: true })
+        config.add_setting(:quarantine_logging, { default: true })
+        config.add_setting(:quarantine_extra_attributes)
+        config.add_setting(:quarantine_failsafe_limit, default: 10)
+        config.add_setting(:quarantine_release_at_consecutive_passes)
+      end
+    end
+
+    # Purpose: binds quarantine to fetch the test_statuses from dynamodb in the before suite
+    sig { void }
+    def self.bind_on_start
+      ::RSpec.configure do |config|
+        config.before(:suite) do
+          Quarantine::RSpecAdapter.quarantine.on_start
         end
       end
     end
-  end
 
-  # Purpose: binds quarantine to record failed and flaky tests
-  def bind_quarantine_record_tests(quarantine)
-    ::RSpec.configure do |config|
-      config.after(:each) do |example|
-        metadata = example.metadata
+    sig { params(example: RSpec::Core::Example).returns(T.nilable([Symbol, T::Boolean])) }
+    def self.final_status(example)
+      metadata = example.metadata
 
-        # will record the failed test if is not quarantined and it is on it's final retry from the rspec-retry gem
-        quarantine.record_failed_test(example) if
-          RSpec.configuration.quarantine_record_failed_tests &&
-          !quarantine.test_quarantined?(example) &&
-          metadata[:retry_attempts] + 1 == metadata[:retry] && example.exception
+      # The user may define their own after hook that marks an example as flaky in its metadata.
+      previously_quarantined = Quarantine::RSpecAdapter.quarantine.test_quarantined?(example) || metadata[:flaky]
 
-        # will record the flaky test if is not quarantined and it failed the first run but passed a subsequent run;
-        # optionally, the upstream RSpec configuration could define an after hook that marks an example as flaky in
-        # the example's metadata
-        quarantine.record_flaky_test(example) if
-          RSpec.configuration.quarantine_record_flaky_tests &&
-          !quarantine.test_quarantined?(example) &&
-          (metadata[:retry_attempts] > 0 && example.exception.nil?) || metadata[:flaky]
+      if example.exception
+        # The example failed _this try_.
+        if metadata[:retry_attempts] + 1 == metadata[:retry]
+          # The example failed all its retries - if it's already quarantined, keep it that way;
+          # otherwise, mark it as failing.
+          if RSpec.configuration.skip_quarantined_tests && previously_quarantined
+            return [:quarantined, false]
+          else
+            return [:failing, false]
+          end
+        end
+        # The example failed, but it's not the final retry yet, so return nil.
+        return nil # rubocop:disable Style/RedundantReturn
+      elsif metadata[:retry_attempts] > 0
+        # The example passed this time, but failed one or more times before - the definition of a flaky test.
+        return [:quarantined, false] # rubocop:disable Style/RedundantReturn
+      elsif previously_quarantined
+        # The example passed the first time, but it's already marked quarantined, so keep it that way.
+        return [:quarantined, true] # rubocop:disable Style/RedundantReturn
+      else
+        return [:passing, true] # rubocop:disable Style/RedundantReturn
       end
     end
 
-    ::RSpec.configure do |config|
-      config.after(:suite) do
-        quarantine.upload_tests(:failed) if RSpec.configuration.quarantine_record_failed_tests
-
-        quarantine.upload_tests(:flaky) if RSpec.configuration.quarantine_record_flaky_tests
+    # Purpose: binds quarantine to record test statuses
+    sig { void }
+    def self.bind_on_test
+      ::RSpec.configure do |config|
+        config.after(:each) do |example|
+          result = Quarantine::RSpecAdapter.final_status(example)
+          if result
+            status, passed = result
+            example.clear_exception! if status == :quarantined && !passed
+            Quarantine::RSpecAdapter.quarantine.on_test(example, status, passed: passed)
+          end
+        end
       end
     end
-  end
 
-  # Purpose: binds quarantine logger to output test to RSpec formatter messages
-  def bind_logger(quarantine)
-    ::RSpec.configure do |config|
-      config.after(:suite) do
-        RSpec.configuration.reporter.message(quarantine.summary) if RSpec.configuration.quarantine_logging
+    sig { void }
+    def self.bind_on_complete
+      ::RSpec.configure do |config|
+        config.after(:suite) do
+          Quarantine::RSpecAdapter.quarantine.on_complete
+        end
       end
+    end
+
+    sig { params(message: String).void }
+    def self.log(message)
+      RSpec.configuration.reporter.message(message)
     end
   end
 end
